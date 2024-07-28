@@ -1,0 +1,781 @@
+---
+title: "Review Analysis"
+author: "Ivan Nicholas Nkuhairwe"
+format: html
+---
+
+# Libraries and Data importation
+
+```{r}
+#| label: Library call and setting working directory
+#| warning: FALSE
+#| message: FALSE
+
+# Libraries
+
+library(foreign)
+library(MASS)
+library(kableExtra)
+library(dplyr)
+library(tidyr)
+library(origami)
+library(tlverse)
+library(sl3)
+library(data.table)
+library(knitr)
+library(haven)
+library(readr)
+library(tlverse)
+
+# working directory
+rstudioapi::getSourceEditorContext()$path %>% dirname() %>% setwd()
+```
+
+
+```{r}
+#| label: Data wrangling
+#| warning: FALSE
+#| message: FALSE
+
+#importing data
+analy_ivan <- read_dta("analy_ivan.dta")
+
+#selecting variables
+vars<-c("hospital_number","venti","corticosteroids_type",
+        "age_at_admission_in_comple","gender","day","hypertension","hyperlipidaemia",
+        "diab_mellitus","hiv_status_1","smoking_status","ckd","neutrophils","lymphocytes",
+        "asthma")
+cov_data<-analy_ivan[vars]
+
+#Coercing to factor or continuous variables
+
+cols<-c("venti","corticosteroids_type",
+        "gender","day","hypertension","hyperlipidaemia",
+        "diab_mellitus","hiv_status_1","ckd","asthma")
+
+#Factor variables
+cov_data[cols]<-lapply(cov_data[cols], factor)
+
+#Continuous variables
+cov_data<-cov_data%>% 
+  mutate_at(c("neutrophils","lymphocytes","hospital_number",
+              "age_at_admission_in_comple"),as.numeric)
+
+# Selecting day1 and day 5 as baseline and end point, drugs dexamethasone(0) and hydrocortisone(3), filter for only two entries then drop unused levels in factors
+
+covdat <- cov_data %>%
+  filter(day %in% c(1, 5), corticosteroids_type %in% c(0, 3)) %>%
+  group_by(hospital_number) %>%
+  filter(n() == 2) %>%
+  droplevels() %>% 
+  as.data.frame()
+
+# Recode factor variables
+
+covdat <- covdat %>%
+  mutate(
+    corticosteroids_type = factor(recode(corticosteroids_type, "3" = "1"), levels = c("0", "1")),
+    across(c(hypertension, hyperlipidaemia, diab_mellitus, hiv_status_1, smoking_status, ckd, asthma), ~factor(., levels = c("0", "1", "2")))
+  )
+# Fill in the Na that carry on from previous ID rows
+
+covdat<-covdat %>% 
+  group_by(hospital_number) %>% 
+  fill(venti,age_at_admission_in_comple,gender,hypertension,
+       hyperlipidaemia,diab_mellitus,hiv_status_1,
+       smoking_status,ckd,asthma,.direction = "down")
+  
+```
+
+
+```{r}
+# Transforming the dataset to wide
+cov <- covdat %>% 
+  pivot_wider(
+    id_cols = hospital_number,
+    names_from = day,
+    values_from = c(neutrophils, lymphocytes, corticosteroids_type,
+                    venti, age_at_admission_in_comple,
+                    gender, hypertension, hyperlipidaemia, diab_mellitus, hiv_status_1,
+                    smoking_status, ckd, asthma)
+  ) %>% #Drop the unwanted columns
+  select(-starts_with("venti_5"), -starts_with("age_at_admission_in_comple_5"),
+         -starts_with("gender_5"), -starts_with("hypertension_5"),
+         -starts_with("hyperlipidaemia_5"), -starts_with("diab_mellitus_5"), -starts_with("hiv_status_1_5"),
+         -starts_with("smoking_status_5"), -starts_with("ckd_5"), -starts_with("asthma_5")) %>%
+  mutate(
+    diff = as.factor(ifelse(corticosteroids_type_1 == corticosteroids_type_5, 1, 0)), #check for diff in treatment.
+    age_at_admission_in_comple_1 = round(age_at_admission_in_comple_1)
+  ) %>%
+  filter(diff == 1)
+
+# Create nlr_1 and nlr_5 without filtering
+cov1 <- cov %>%
+  mutate(
+    nlr_1 = neutrophils_1 / lymphocytes_1,
+    nlr_5 = neutrophils_5 / lymphocytes_5
+  ) %>%
+  select(-diff, -corticosteroids_type_5)
+
+# Write CSV file for the dataset with NLR included
+write_csv(cov1, "dex_hdx_mi.csv", na = ".")
+
+# Create a complete case dataset by filtering out NA values in NLR
+cov_com <- cov1 %>% 
+  filter(!is.na(nlr_1), !is.na(nlr_5))
+  
+
+# Write CSV file for the complete case dataset
+write_csv(cov_com, "dex_hdx.csv", na = ".")
+
+```
+
+
+```{r}
+library(mice) # Imputation
+library(VIM) # Visualization of missingness pattern
+library(stringr) # Strings manipulation
+
+# Check for missingness pattern before dropping variable
+aggr_plot <- aggr(cov1, col = c("blue", "red"), numbers = TRUE, sortVars = TRUE,
+                  labels = names(cov1), cex.axis = .5, gap = 3, 
+                  ylab = c("Histogram of missing data", "Pattern"))
+
+# Drop smoking_status with 44% missingness
+cov2 <- cov1 %>% select(-smoking_status_1)
+
+# Rename specific columns for clarity
+rename_cols <- c("corticosteroids_type_1", "venti_1", "age_at_admission_in_comple_1",
+                 "gender_1", "hypertension_1", "hyperlipidaemia_1",
+                 "diab_mellitus_1", "hiv_status_1_1", "ckd_1", "asthma_1")
+
+cov2 <- cov2 %>% 
+  rename_with(~str_replace(., "_1$", ""), all_of(rename_cols))
+
+cov_com <- cov_com %>% 
+  select(-smoking_status_1) %>% 
+  rename_with(~str_replace(., "_1$", ""), all_of(rename_cols))
+
+# Check for missingness pattern after dropping variable
+aggr_plot1 <- aggr(cov2, col = c("blue", "red"), numbers = TRUE, sortVars = TRUE,
+                   labels = names(cov2), cex.axis = .5, gap = 3, 
+                   ylab = c("Histogram of missing data", "Pattern"))
+
+aggr_plot2 <- aggr(cov_com, col = c("blue", "red"), numbers = TRUE, sortVars = TRUE,
+                   labels = names(cov_com), cex.axis = .5, gap = 3, 
+                   ylab = c("Histogram of missing data", "Pattern"))
+
+# Drop all rows with missing variables from cov_com to have a complete dataset
+cov_com2<-cov_com %>%
+  drop_na()
+
+aggr_plot3 <- aggr(cov_com2, col = c("blue", "red"), numbers = TRUE, sortVars = TRUE,
+                   labels = names(cov_com2), cex.axis = .5, gap = 3, 
+                   ylab = c("Histogram of missing data", "Pattern"))
+
+```
+
+
+```{r}
+#| label: More wrangling
+
+library(crosstable)#library to create summary table
+
+#rename columns
+cov2<-cov2 %>% 
+  rename(treatment=corticosteroids_type,age=age_at_admission_in_comple,
+         id=hospital_number,hiv_status=hiv_status_1) %>% as.data.frame()
+
+cov_com2<-cov_com2 %>% 
+  rename(treatment=corticosteroids_type,age=age_at_admission_in_comple,
+         id=hospital_number,hiv_status=hiv_status_1) %>% as.data.frame()
+
+all<-c("neutrophils_1","neutrophils_5","lymphocytes_1","lymphocytes_5",
+       "treatment","venti","age","gender","hypertension",
+       "hyperlipidaemia","diab_mellitus","hiv_status","ckd","asthma","nlr_1","nlr_5")
+
+vs<-c("venti","age","gender","hypertension",
+       "hyperlipidaemia","diab_mellitus","hiv_status","ckd","asthma","nlr_1","nlr_5")
+
+
+cov2lab<-data.frame(
+  name=c("neutrophils_1","neutrophils_5","lymphocytes_1","lymphocytes_5",
+         "treatment","venti","age","gender","hypertension",
+         "hyperlipidaemia","diab_mellitus","hiv_status","ckd","asthma","nlr_1","nlr_5"),
+  label=c("Neutrophils at baseline","Neutrophils on day 5","Lymphocytes at baseline",
+          "Lymphocytes on day 5","Corticosteroids type",
+          "Ventilation status","Age at admission","Gender","Hypertension status",
+          "Hyperlipidaemia status","Diabetes Mellitus","HIV status","Chronic Kidney disease",
+          "Asthma","Neutrophil-Lymphocyte Ratio at baseline",
+          "Neutrophil-Lymphocyte Ratio on day 5")
+)
+```
+
+
+
+```{r}
+#| label: Passive Imputation
+#| warning: FALSE
+#| message: FALSE
+
+library(lattice)
+
+#Setting initial values, predictor matrix and method
+dat<-cov2[,-1] # remove ID column
+
+# Initial
+
+# ini<-mice(dat, maxit=0,print=F)
+
+# Method
+
+# meth<-ini$meth # {if using ini}
+
+meth<-make.method(dat)
+meth["nlr_1"]<- "~I(neutrophils_1/lymphocytes_1)"
+meth["nlr_5"]<- "~I(neutrophils_5/lymphocytes_5)"
+
+
+#Predictor matrix
+
+# Remove nlr_1 and nlr_5 as predictors for their respective variables to remove circularity
+
+# pred<-ini$pred{if using ini}
+
+pred<-make.predictorMatrix(dat)
+pred[c("neutrophils_1","lymphocytes_1"), "nlr_1"]<-0
+pred[c("neutrophils_1","lymphocytes_1"), "nlr_5"]<-0
+
+pred[c("neutrophils_5","lymphocytes_5"), "nlr_5"]<-0
+pred[c("neutrophils_5","lymphocytes_5"), "nlr_1"]<-0
+
+#Imputation
+#10 iterations, 5 datasets imputed(default)
+imp<-mice(dat,meth=meth,pred=pred,maxit=10, seed=245,print=F)
+
+
+# Diagnostics for imputation
+
+# Check if the relationship between nlr and neutrophils, lymphocytes is preserved: covergence of nlr_1 and nlr_5
+
+xyplot(imp, nlr_1 ~I(neutrophils_1/lymphocytes_1), #na.groups = nmis,
+       cex = c(1, 1), pch = c(1, 20),
+       ylab = "NLR on baseline Imputed", xlab = "NLR on baseline Calculated")
+
+xyplot(imp, nlr_5 ~I(neutrophils_5/lymphocytes_5), #na.groups = miss,
+       cex = c(1, 1), pch = c(1, 20),
+       ylab = "NLR on day 5 Imputed", xlab = "NLR on day 5 Calculated")
+
+# Check for covergence for specific nlr's alone
+
+plot(imp, c("nlr_1"))
+
+plot(imp, c("nlr_5"))
+
+```
+
+# Descriptives 
+
+```{r}
+
+cov_df<-complete(imp) # Extract first imputed dataset
+
+# Imputed data
+cov_df %>% 
+  import_labels(cov2lab) %>% 
+  crosstable(total = "both") %>% 
+  flextable::as_flextable()
+
+# Complete case
+cov_com2[,-1] %>% 
+  import_labels(cov2lab) %>% 
+  crosstable(total = "both") %>% 
+  flextable::as_flextable()
+
+# Data insitu
+cov2[,-1] %>% 
+  import_labels(cov2lab) %>% 
+  crosstable(total = "both") %>% 
+  flextable::as_flextable()
+
+
+```
+
+
+```{r}
+#| label: variable cross tabulation by treatment
+
+# Data insitu
+cov2[,-1] %>% 
+  import_labels(cov2lab) %>% 
+  crosstable(c(all_of(vs)),total = "column", by = treatment, showNA = "no",test = T) %>% 
+  flextable::as_flextable()
+
+# Complete case 
+cov_com2[,-1] %>% 
+  import_labels(cov2lab) %>% 
+  crosstable(c(all_of(vs)),total = "column", by = treatment, showNA = "no", test = T) %>% 
+  flextable::as_flextable()
+
+# Imputed dataset
+
+cov_df %>% 
+  import_labels(cov2lab) %>% 
+  crosstable(c(all_of(vs)),total = "column", by = treatment, showNA = "no", test = T) %>% 
+  flextable::as_flextable()
+
+
+```
+
+
+# TMLE
+
+## TMLE-SL
+
+
+
+```{r}
+library(tmle3)
+
+# Define node list
+
+node_list<-list(W=c("venti","age","gender","hypertension",
+       "hyperlipidaemia","diab_mellitus","hiv_status","ckd","asthma","nlr_1"),
+       A="treatment",
+       Y="nlr_5")
+
+# Process data 
+
+cov22<-data.table::copy(cov_df) # Imputed
+cov33<-data.table::copy(cov_com2[,-1]) # Complete case analysis
+cov44<-data.table::copy(cov2[,-1]) # Data as is
+
+processed <- process_missing(cov22, node_list)
+cov22<- processed$data
+node_list <- processed$node_list
+
+#ATE SPEC
+ate_spec <- tmle_ATE(
+  treatment_level = "1",
+  control_level = "0"
+)
+
+```
+
+
+```{r}
+# Choose base learners
+
+lrn_mean <- make_learner(Lrnr_mean) # mean model
+
+lrn_glm<-make_learner(Lrnr_glm) # generalized linear models
+
+
+lrn_bayesglm <- make_learner(Lrnr_bayesglm) # Bayes-glm
+
+# Penalized regression
+lrn_ridge<-make_learner(Lrnr_glmnet, alpha = 0) # ridge regression
+lrn_lasso <- make_learner(Lrnr_glmnet) # lasso-penalized regressions
+
+lrn_gam<-make_learner(Lrnr_gam) # Generalised additive models
+
+# Tree-based methods
+lrn_xgb<-make_learner(Lrnr_xgboost) # Extreme gradient boosting
+lrn_rf <- make_learner(Lrnr_ranger) # Faster random forests
+
+# spline regressions:
+lrn_polspline <- make_learner(Lrnr_polspline)
+lrn_earth <- make_learner(Lrnr_earth)
+
+#collect learners in a stack
+stack<- make_learner(Stack, lrn_mean,lrn_glm,lrn_bayesglm,lrn_ridge,lrn_lasso,
+                     lrn_gam, lrn_xgb,lrn_rf,lrn_polspline,lrn_earth)
+
+
+# Define meta-learners for continuous and categorical
+
+lrn_nnls <- make_learner(Lrnr_nnls)
+
+lrn_solnp <- make_learner(Lrnr_solnp,
+                        loss_function= loss_loglik_binomial,
+                        learner_function= metalearner_logistic_binomial)
+
+# Discrete Super Learner
+
+d_MSE<-Lrnr_cv_selector$new(eval_function = loss_squared_error)# discrete superlearner continuous outcome
+
+d_bin<-Lrnr_cv_selector$new(eval_function = loss_loglik_binomial) # discrete superlearner binary treatment
+
+sl_Y <- Lrnr_sl$new(
+  learners = stack,
+  metalearner = d_MSE
+)
+sl_A <- Lrnr_sl$new(
+  learners = stack,
+  metalearner = d_bin
+)
+
+learner_list <- list(A = sl_A, Y = sl_Y)
+
+# No dsl
+sl2_Y <- Lrnr_sl$new(
+  learners = stack,
+  metalearner = lrn_nnls
+)
+sl2_A <- Lrnr_sl$new(
+  learners = stack,
+  metalearner = lrn_solnp
+)
+
+learner_list2<-list(A = sl2_A, Y = sl2_Y)
+
+```
+
+
+```{r}
+#| label: Discrete learner then nnls,solnp mlearners
+#| warning: FALSE
+#| messages: FALSE
+
+library(future)# Parallel processing
+
+ncores <- availableCores()-1
+
+plan(multicore, workers= ncores)
+
+# Imputed data
+
+set.seed(1235)
+tmle_fit_dsl <- tmle3(ate_spec,cov22, node_list, learner_list)
+
+print(tmle_fit_dsl)
+
+# Non-dsl
+set.seed(1235)
+tmle_fit_ndsl <- tmle3(ate_spec,cov22, node_list, learner_list2)
+
+print(tmle_fit_ndsl)
+
+```
+
+
+```{r}
+#| label: Discrete learner then nnls,solnp mlearners
+#| warning: FALSE
+#| messages: FALSE
+
+processed <- process_missing(cov33, node_list)
+cov33<- processed$data
+node_list <- processed$node_list
+
+# CC data
+
+set.seed(1235)
+tmle_fit_dsl1 <- tmle3(ate_spec,cov33, node_list, learner_list)
+
+print(tmle_fit_dsl1)
+
+# Non-dsl
+set.seed(1235)
+tmle_fit_ndsl1 <- tmle3(ate_spec,cov33, node_list, learner_list2)
+
+print(tmle_fit_ndsl1)
+
+```
+
+
+
+```{r}
+#| label: Discrete learner then nnls,solnp mlearners
+#| warning: FALSE
+#| messages: FALSE
+
+processed <- process_missing(cov44, node_list)
+cov44<- processed$data
+node_list <- processed$node_list
+
+# Data insitu
+
+set.seed(1235)
+tmle_fit_dsl2 <- tmle3(ate_spec,cov44, node_list, learner_list)
+
+print(tmle_fit_dsl1)
+
+# Non-dsl
+set.seed(1235)
+tmle_fit_ndsl2 <- tmle3(ate_spec,cov44, node_list, learner_list2)
+
+print(tmle_fit_ndsl2)
+
+```
+
+
+# BART-TMLE
+
+```{r}
+#| label: transform to all numerics
+#| warning: FALSE
+#| message: FALSE
+
+col_chng<-c("venti","treatment",
+        "gender","hypertension","hyperlipidaemia",
+        "diab_mellitus","hiv_status","ckd","asthma")
+
+# Data In-situ
+cov2_bart<-cov2 %>% 
+  mutate_at(vars(col_chng),~as.numeric(as.character(.)))
+
+# Imputed data
+covdf_bart<-cov_df %>% 
+  mutate_at(vars(col_chng),~as.numeric(as.character(.)))
+
+# CC data
+covcom_bart<-cov_com2 %>% 
+  mutate_at(vars(col_chng),~as.numeric(as.character(.)))
+
+```
+
+
+```{r}
+
+#| label: BART
+#| warning: FALSE
+#| message: FALSE
+
+library(bartCause)
+library(arm)
+
+confounders<-c('venti','age','gender','hypertension','hyperlipidaemia',
+               'diab_mellitus','hiv_status','ckd','asthma','nlr_1')
+
+# Data complete case
+
+plan(multicore,workers=ncores)
+
+cc_bartfit<-bartc(response = covcom_bart[['nlr_5']],
+                treatment = covcom_bart[['treatment']], 
+                confounders = as.matrix(covcom_bart[, confounders]),
+                method.rsp = 'tmle',
+                method.trt='bart',
+                estimand = 'ate',
+                commonSup.rule = 'chisq', seed=1235)
+summary(cc_bartfit)
+
+# Imputed data
+
+imp_bartfit<-bartc(response = covdf_bart[['nlr_5']],
+                treatment = covdf_bart[['treatment']], 
+                confounders = as.matrix(covdf_bart[, confounders]),
+                method.rsp = 'tmle',
+                method.trt='bart',
+                estimand = 'ate',
+                commonSup.rule = 'chisq', seed=1235)
+summary(imp_bartfit)
+
+```
+
+
+```{r}
+library(plotBart)
+plot_common_support(imp_bartfit,
+          rule = "both")
+
+plot_common_support(cc_bartfit,
+          rule = "both")
+```
+
+
+## PAR-TMLE
+
+```{r}
+#| label: Parametric regression and TMLE
+#| warning: FALSE
+#| message: FALSE
+
+# Data imputed
+
+par.cov2<-data.table::copy(covdf_bart)
+
+min.nlr_5<-min(par.cov2$nlr_5)
+max.nlr_5<-max(par.cov2$nlr_5)
+par.cov2$nlr5_bounded<-(par.cov2$nlr_5-min.nlr_5)/(max.nlr_5-min.nlr_5)
+
+#Outcome model-linear regression
+model_0<-glm(nlr5_bounded~venti+age+gender+hypertension+hyperlipidaemia+
+         diab_mellitus+hiv_status+ckd+asthma+
+         as.factor(treatment)+nlr_1+I(age^2)+I(nlr_1^2), family = "binomial", data = par.cov2)
+
+# Prediction of A,A=1,A=0
+
+qAW= predict(model_0, type="response")
+
+m0<- glm(nlr5_bounded~as.factor(venti)+age+as.factor(gender)+as.factor(hypertension)+
+          as.factor(hyperlipidaemia)+as.factor(diab_mellitus)+as.factor(hiv_status)+
+          as.factor(ckd)+as.factor(asthma)+
+          nlr_1+I(age^2)+I(nlr_1^2), family = "binomial", data = subset(par.cov2,treatment==0))
+
+m1<- glm(nlr5_bounded~venti+age+gender+hypertension+hyperlipidaemia+
+         diab_mellitus+hiv_status+ckd+asthma+
+         nlr_1+I(age^2)+I(nlr_1^2),family = "binomial", data = subset(par.cov2,treatment==1))
+
+q0W=predict(m0, newdata=par.cov2, type="response")
+q1W=predict(m1, newdata=par.cov2, type="response")
+
+mean(q1W-q0W);
+
+```
+
+
+```{r}
+#| label: Propensity score model with quadratic terms
+
+ps.mod<-glm(treatment~venti+age+gender+hypertension+hyperlipidaemia+
+         diab_mellitus+hiv_status+ckd+asthma+
+         nlr_1+I(age^2)+I(nlr_1^2),
+            data=par.cov2, family="binomial")
+
+# Propensity score prediction
+
+ps.hat=as.vector(predict.glm(ps.mod,type=c("response")))
+
+#Appending the propensity scores to the data frame
+
+par.cov2=data.frame(par.cov2,ps.hat)
+```
+
+
+```{r}
+#| label: Clever covariates
+
+
+#Clever covariate and fluctuating/substitution parameters
+
+H_0W = (1-par.cov2$treatment/(1-ps.hat))
+
+H_1W = par.cov2$treatment/ps.hat
+
+H_AW = H_1W-H_0W
+
+par.cov2= data.frame(par.cov2,H_1W,H_0W,H_AW)
+
+# Epislon
+
+epsilon.mod <- glm(par.cov2$nlr5_bounded~ -1+H_0W + H_1W + offset(qlogis(qAW)), family = "binomial")
+epsilon<-coef(epsilon.mod)
+epsilon['H_0W']
+epsilon['H_1W']
+
+```
+
+```{r}
+
+
+y0.hat_1<-plogis(qlogis(q0W)+epsilon['H_0W']*par.cov2$H_0W) #/(1-ps.hat))
+
+y1.hat_1 <-plogis(qlogis(q1W)+epsilon['H_1W']*par.cov2$H_1W) #/ps.hat)
+
+#mean difference
+te<-(y1.hat_1-y0.hat_1)
+
+ATE= mean(te,na.rm = TRUE)
+ATE
+
+#Rescale the ATE from the bounded.
+
+ATE.tmle<-(max.nlr_5-min.nlr_5)*ATE
+ATE.tmle
+
+```
+
+```{r}
+
+#| label: Statistical inference (95% ci, se)
+
+#Rescale the predicted values
+y0.hat.rescaled<-(max.nlr_5-min.nlr_5)*y0.hat_1+min.nlr_5
+y1.hat.rescaled<-(max.nlr_5-min.nlr_5)*y1.hat_1+min.nlr_5
+#Expectations rescaled
+EY0<-mean(y0.hat.rescaled, na.rm = T)
+EY1<-mean(y1.hat.rescaled, na.rm = T)
+
+#ATE efficient influence curve (EIC)
+D1 <-par.cov2$treatment/ps.hat*(par.cov2$nlr_5 - y1.hat.rescaled) + y1.hat.rescaled - EY1
+D0 <- (1-par.cov2$treatment)/(1 - ps.hat)*(par.cov2$nlr_5 - y0.hat.rescaled) + y0.hat.rescaled - EY0
+EIC <- D1 - D0
+#ATE variance
+n <- nrow(par.cov2)
+varHat.IC <- var(EIC, na.rm = T)/n
+#ATE 95%CI
+ATEtmle_CI_LO <- c(ATE.tmle - 1.96*sqrt(varHat.IC))
+ATEtmle_CI_UP<-c(ATE.tmle + 1.96*sqrt(varHat.IC))
+ATE.tmle
+ATEtmle_CI_LO
+ATEtmle_CI_UP
+se_ATE<-sqrt(varHat.IC)
+se_ATE
+
+```
+
+```{r}
+ptmle_est<-data.frame(estimate=ATE.tmle,
+                      se=se_ATE,
+                      conf.lower=ATEtmle_CI_LO,
+                      conf.upper=ATEtmle_CI_UP)
+print(ptmle_est)
+
+```
+
+```{r}
+
+df <- data.frame(
+  Method = c("SLTMLE-DSL-OBS", "SLTMLE-NoDSL-OBS", "SLTMLE-DSL-IMP",
+             "SLTMLE-NoDSL-IMP","SLTMLE-DSL-CC","SLTMLE-NoDSL-CC",
+             "BART-TMLE-IMP","BART-TMLE-CC","PAR-TMLE-IMP","PAR-TMLE-CC"),
+  Estimate = c(-0.943, -0.509, -0.309, -0.308,-0.943,-0.638,0.246,-0.043,1.245,0.878),
+  Lower_CI = c(-5.175, -4.605, -3.800, -4.040,-5.175,-4.812,-3.399,-3.919,-1.882,-2.456),
+  Upper_CI = c(3.289, 3.587, 3.182, 3.424,3.289,3.536,3.891,3.832,4.372,4.213)
+)
+
+
+```
+
+
+
+
+```{r}
+ggplot(df, aes(x=Estimate, y=Method, color=Method)) +
+  geom_point() +
+  geom_errorbar(aes(xmin=Lower_CI, xmax=Upper_CI), width=.1) +
+  scale_color_d3() +  # Use D3 color palette from ggsci
+  theme_minimal() +
+  ggtitle("Forest plot of ATE estimates and their 95% confidence intervals") +
+  theme(plot.title = element_text(face = "bold",hjust = 0.5)) +
+  ggeasy::easy_center_title() +
+  theme(legend.position = "right",legend.box.background = element_rect(color="tan", linewidth = 1.0),
+        strip.text = element_text(size = 8))
+  labs( x="", y="")+geom_text()
+
+
+```
+
+
+
+```{r}
+library(lava)
+library(grid)
+
+forestplot(df$Estimate, lower = df$Lower_CI,
+           upper = df$Upper_CI, delta = 0.05, 
+           labels = NULL,
+           cex.estimate = 1.0, text.right = F,
+           cex.axis = 0.8, cex = 1.2,
+           xlim = c(-16,16),xlab = "ATE(95% Confidence Interval)")
+# Add black, bold labels manually
+text(x = rep(-8, length(df$Method)),  # Adjust x position as needed
+     y = 1:length(df$Method),
+     labels = df$Method,
+     col = "black",
+     font = 2,  # Bold font
+     adj = 1)  # Right align
+
+```
